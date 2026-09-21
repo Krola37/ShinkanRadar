@@ -391,9 +391,18 @@ def collect_todays_releases(calendar_service):
     for event in resp.get("items", []):
         props = event.get("extendedProperties", {}).get("private", {})
         title = props.get("title", "").strip()
+        volume, genre = props.get("volume", ""), props.get("genre", "")
+        if not title:
+            # ver1.22より前に登録されたイベントはextendedPropertiesを持たないため、
+            # 当時から入っていたdescription（作品タイトル：/巻数：/ジャンル：）から復元する
+            fields = dict(
+                line.split("：", 1) for line in event.get("description", "").splitlines() if "：" in line
+            )
+            title = fields.get("作品タイトル", "").strip()
+            volume, genre = fields.get("巻数", "").strip(), fields.get("ジャンル", "").strip()
         if not title:
             continue  # このスクリプト以外が作成したイベント等は対象外
-        items.append((title, props.get("volume", ""), props.get("genre", "")))
+        items.append((title, volume, genre))
     return items
 
 
