@@ -18,7 +18,7 @@ GAS版からの移植版（HTML解析をBeautifulSoup+検証済みロジック�
   H: 手動確認フラグ（自動検索で解決できない作品の印。TRUEの間は自動検索を
      スキップしF列だけ更新する。月次まとめDiscord通知の対象にもなる）
   I1: （内部管理用）本日発売ダイジェストの送信済み日付
-  J: 手動検索済みチェック（B・C列を手動で埋めてTRUEにするとカレンダー登録・
+  J: 登録反映チェック（B・C列を手動で埋めてTRUEにするとカレンダー登録・
      Discord通知を行い、処理後に自動でFALSEへ戻る）
 """
 
@@ -670,7 +670,7 @@ def batch_update_row(ws, row_index, values):
 # メイン処理
 # ------------------------------------------------------------
 def process_manual_rows(ws, calendar_service, rows):
-    """J列（手動検索済みチェック）がONの行を最優先で処理する"""
+    """J列（登録反映チェック）がONの行を最優先で処理する"""
     for i, row in enumerate(rows[1:], start=2):
         title = row[0].strip() if len(row) > 0 else ""
         is_manual_trigger = row[9].strip() if len(row) > 9 else ""
