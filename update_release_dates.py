@@ -17,7 +17,8 @@ GAS版からの移植版（HTML解析をBeautifulSoup+検証済みロジック�
   G: Discord通知フラグ
   H: 手動確認フラグ（自動検索で解決できない作品の印。TRUEの間は自動検索を
      スキップしF列だけ更新する。月次まとめDiscord通知の対象にもなる）
-  I1: （内部管理用）本日発売ダイジェストの送信済み日付
+  I: 手動確認の検索リンク（シート側の数式。スクリプトは読み書きしない）
+  S1: （内部管理用）本日発売ダイジェストの送信済み日付
   J: 登録反映チェック（B・C列を手動で埋めてTRUEにするとカレンダー登録・
      Discord通知を行い、処理後に自動でFALSEへ戻る）
 """
@@ -406,18 +407,19 @@ def collect_todays_releases(calendar_service):
     return items
 
 
-# I1セルに「本日分のダイジェストを送信済みか」の日付を記録する（再実行時の重複送信防止用）。
+# S1セルに「本日分のダイジェストを送信済みか」の日付を記録する（再実行時の重複送信防止用）。
 # GitHub Actionsのワークフローは接続不良時に新しいランナーでジョブ全体を
 # 再実行するフォールバック構成になっており、ダイジェスト送信後に別の理由で
 # ジョブが失敗すると、再実行時に同じ内容のダイジェストが再送されてしまう
 # 問題があったため導入した。
 DAILY_DIGEST_SENT_DATE_ROW = 1
-DAILY_DIGEST_SENT_DATE_COL = 9  # I列
+DAILY_DIGEST_SENT_DATE_COL = 19  # S列（I1は検索列の見出しなので使わない）
 
 
 def get_daily_digest_sent_date(rows):
     header_row = rows[0] if rows else []
-    return header_row[8].strip() if len(header_row) > 8 else ""
+    i = DAILY_DIGEST_SENT_DATE_COL - 1
+    return header_row[i].strip() if len(header_row) > i else ""
 
 
 def mark_daily_digest_sent(ws, date_str):
@@ -430,7 +432,7 @@ def send_daily_digest(rows, ws, calendar_service):
     個別の新刊検知通知（send_discord）とは別に、本日が開始日のカレンダー
     イベントを全件集計する（スプレッドシートのG列フラグは問わない）。
     0件の日は送信しない。同じ日に二重実行（リトライ）されても再送しない
-    よう、I1セルに送信済み日付を記録し、既に本日分を送信済みならスキップ
+    よう、S1セルに送信済み日付を記録し、既に本日分を送信済みならスキップ
     する。
     """
     if not DISCORD_WEBHOOK_URL:
