@@ -21,6 +21,10 @@ GAS版からの移植版（HTML解析をBeautifulSoup+検証済みロジック�
   S1: （内部管理用）本日発売ダイジェストの送信済み日付
   J: 登録反映チェック（B・C列を手動で埋めてTRUEにするとカレンダー登録・
      Discord通知を行い、処理後に自動でFALSEへ戻る）
+  K: 基準の書名  L: ISBN  M: レーベル  N: 著者
+     （前回確認できた本。次回の判定の基準にする。巻数がB列と違う場合は使わず推測し直す。
+       K列を空にすると推測し直す）
+  O: 要確認（自動では記録せず、人が確認する内容。解決すると空になる）
 """
 
 import json
@@ -138,128 +142,123 @@ def simplify_title_for_search(title):
 
 DATE_PATTERN = re.compile(r"([0-9]{2})年([0-9]{1,2})月([0-9]{1,2})日\(([月火水木金土日])\)")
 
-# .name の巻数表記は複数パターンが混在している（実データで確認済み）。
-# 優先度順に上から試し、最初にマッチしたものを採用する。
-#   1. "タイトル(N)"（括弧内数字。"(N)(完)" "(コミック)(N)" "(N)特装版..." も含む）
-#      例: ヴァニタスの手記(11) / おっさん冒険者ケインの善行(16)(完) /
-#          転生したら最強種たちが住まう島でした。この島でスローライフを楽しみます(コミック)(9)
-#   2. "タイトル[N]"（角括弧内数字）
-#      例: 不死の葬儀師[2]
-#   3. "タイトルN巻" / "タイトル N巻" / "タイトル第N巻"（「第」はあってもなくても対応）
-#      例: 大正もののけ闇祓いバッケ坂の怪異1巻 / 大正もののけ闇祓い バッケ坂の怪異 2巻 /
-#          穏やか貴族の休暇のすすめ。@COMIC 第11巻
-#   4. "タイトル N"（末尾がそのまま数字。従来対応していた形式）
-#      例: ONE PIECE 115
-#   5. "タイトルN サブタイトル" / "タイトル N サブタイトル"（巻数の直後に空白を挟んで
-#      サブタイトルが続く。タイトルと巻数の間の空白は有無どちらも許容する）
-#      例: 骨姫ロザリー 3 〜死者の最期を追体験し、力を引き継ぐ〜 /
-#          アサシンズプライド15 暗殺教師と無能彩燦姫（タイトル直後に空白なしで巻数が続く）
-VOLUME_PATTERNS = [
-    re.compile(r"^(.*?)\((\d{1,4})\)"),
-    re.compile(r"^(.*?)\[(\d{1,4})\]"),
-    re.compile(r"^(.*?)[\s　]*第?(\d{1,4})巻"),
-    re.compile(r"^(.*?)[\s　]*(\d{1,4})$"),
-    re.compile(r"^(.*?)[\s　]*(\d{1,4})[\s　]"),
-]
-
-
-def extract_title_and_volume(name_text):
-    """.name のテキストから (タイトル, 巻数) を抽出する。抽出できなければ (None, None)。"""
-    for pattern in VOLUME_PATTERNS:
-        m = pattern.match(name_text)
-        if m:
-            return m.group(1).strip(), int(m.group(2))
-    return None, None
-
 # ジャンル（スプレッドシートD列）ごとに、type-tag（カテゴリ表示）の
 # 許可リストを切り替える（ホワイトリスト方式）。
 # サイトが検索対象のジャンルによって別ドメイン（comic./novel./bunko.）に
 # 分かれているのに加え、同じサイト内でもtype-tagの値がジャンルによって
-# 異なる（例: コミックサイトは「コミック」、ライトノベルサイトは
-# 「ライトノベル」「TL」「ジュニアノベル」など複数）ため、
-# ジャンルごとに許可するtype-tagを個別に定義する。
+# 異なるため、ジャンルごとに許可するtype-tagを個別に定義する。
 #
 # 実データで確認済みの値：
 #   コミック     : "コミック"
-#   ライトノベル : "ライトノベル" / "TL" / "ジュニアノベル"（実データで確認済み）
+#   ライトノベル : "ライトノベル" / "TL" / "ジュニアノベル"
 #   文庫         : 未確認（"文庫"を仮設定。誤除外が出たら調整）
-#
-# ライトノベルの "TL"（ティーンズラブ）・"ジュニアノベル"（映画ノベライズ等）を
-# 対象に含めたくない場合は、該当ジャンルのsetから取り除いてください。
 ALLOWED_CATEGORIES = {
     "コミック": {"コミック", "単行本"},
     "ライトノベル": {"ライトノベル", "TL", "ジュニアノベル"},
     "文庫": {"文庫"},
 }
 
+# 特装版・関連本と外伝は、本編の新刊として扱わない（作品名より後ろの部分で判定する）。
+NG_PATTERN = re.compile(
+    r"特装版|限定版|同梱版|ガイドブック|キャラクターブック|ファンブック|スペシャルブック"
+    r"|BOOK|MEMORIAL|祝ノ書|画集|Art ?Works|シナリオ集|ぬり絵|カレンダー|巻セット|完結セット|セット\(全",
+    re.I,
+)
+SPIN_PATTERN = re.compile(r"外伝|番外編|短編集|スピンオフ|蛇足編|-(another|extra|after|before)-", re.I)
+# 巻数（15 / 12.5 / (5) / XIII）と、その直前の言葉（本編の目印）を切り出す。
+# "3年生編5" の "3" のように「年」が続く数字は巻数とみなさない。
+TOKEN_PATTERN = re.compile(
+    r"^(.*?)(\(?\d+(?:\.\d+)?\)?|(?<![A-Za-z])[IVXL]+(?![A-Za-z]))(?=$|\s|\(|[^\d.A-Za-z年])"
+)
 
-def extract_items(html):
+
+def split_after_title(name, title):
+    """書名が作品名で始まれば残りを返す。始まらなければ None。"""
+    target = normalize_title(title)
+    n = unicodedata.normalize("NFKC", name)
+    for i in range(len(n) + 1):
+        head = normalize_title(n[:i])
+        if head == target:
+            return TILDE_VARIANTS_PATTERN.sub("~", n[i:]).strip()
+        if not target.startswith(head):
+            return None
+    return None
+
+
+def token_value(token):
+    t = token.strip("()")
+    if t[0].isdigit():
+        return float(t)
+    total = prev = 0
+    for ch in reversed(t):
+        v = {"I": 1, "V": 5, "X": 10, "L": 50}[ch]
+        total += -v if v < prev else v
+        prev = max(prev, v)
+    return float(total)
+
+
+def signature_and_volume(rest):
+    """作品名より後ろの部分から (本編の目印, 巻数) を返す。巻数がなければ (None, None)。"""
+    m = TOKEN_PATTERN.match(rest)
+    if not m:
+        return None, None
+    value = token_value(m.group(2))
+    # ローマ数字の XV がサイトで "105"（10 と 5）と表記される。末尾の (15) と一致するときだけ直す。
+    split = re.fullmatch(r"([1-4]0)(\d)", m.group(2))
+    tail = re.search(r"\((\d+)\)\s*$", rest)
+    if split and tail and int(split.group(1)) + int(split.group(2)) == int(tail.group(1)):
+        value = float(tail.group(1))
+    return re.sub(r"\s", "", m.group(1)), value
+
+
+def isbn13(asin):
+    """検索結果の項目ID（ISBN-10）をISBN-13にする。ISBN-10でなければそのまま返す。"""
+    if not re.fullmatch(r"\d{9}[\dX]", asin):
+        return asin
+    body = "978" + asin[:9]
+    check = (10 - sum(int(d) * (3 if i % 2 else 1) for i, d in enumerate(body)) % 10) % 10
+    return body + str(check)
+
+
+def parse_items(html):
     """
-    検索結果ページのHTMLから「作品タイトル・巻数・発売日・カテゴリ」の
-    一覧を抽出する（実際のタグ構造に基づく解析）。カテゴリによる絞り込みは
-    ここでは行わず、全件を返す（呼び出し側でフィルタ・デバッグ出力を行う）。
+    検索結果ページのHTMLから本の一覧を抽出する。絞り込みはここでは行わない。
 
     ページ構造（実データで確認済み）：
-      <li class="item">
+      <li class="item" id="ISBN-10">
         <div class="Types"><span class="type type-tag">コミック</span></div>
         <div class="name">ONE PIECE 115</div>
         <div class="sab"><span>26年7月3日(金)</span><span>尾田栄一郎</span></div>
-        ...
+        <div class="sab"><span>ジャンプコミックス</span><span>集英社</span></div>
       </li>
     """
-    soup = BeautifulSoup(html, "html.parser")
-    items = []
-
-    for li in soup.select("li.item"):
-        type_tag = li.select_one(".type-tag")
-        category = type_tag.get_text(strip=True) if type_tag else ""
-
-        name_div = li.select_one(".name")
-        if not name_div:
+    out = []
+    for li in BeautifulSoup(html, "html.parser").select("li.item"):
+        name, sabs = li.select_one(".name"), li.select(".sab")
+        if not name or not sabs:
             continue
-        name_text = name_div.get_text(strip=True)
-
-        sab_divs = li.select(".sab")
-        if not sab_divs:
-            continue
-        date_span = sab_divs[0].find("span")
-        if not date_span:
-            continue
-        date_text = date_span.get_text(strip=True)
-
-        dm = DATE_PATTERN.match(date_text)
+        spans = [s.get_text(strip=True) for d in sabs for s in d.find_all("span")]
+        dm = DATE_PATTERN.match(spans[0]) if spans else None
         if not dm:
             continue
-
-        vm_title, vm_volume = extract_title_and_volume(name_text)
-        if vm_title is None:
-            # 巻数を認識できない（単発作品など）はスキップ対象にする
-            continue
-        title, volume = vm_title, vm_volume
-
-        items.append(
-            {
-                "title": title,
-                "volume": volume,
-                "year": 2000 + int(dm.group(1)),
-                "month": int(dm.group(2)),
-                "day": int(dm.group(3)),
-                "weekday": dm.group(4),
-                "category": category,
-            }
-        )
-    return items
+        label_span = sabs[1].find("span") if len(sabs) > 1 else None
+        tag = li.select_one(".type-tag")
+        out.append({
+            "name": name.get_text(strip=True),
+            "category": tag.get_text(strip=True) if tag else "",
+            "date": f"{2000 + int(dm.group(1))}/{int(dm.group(2)):02d}/{int(dm.group(3)):02d}",
+            "isbn": isbn13(li.get("id", "")),
+            "label": label_span.get_text(strip=True) if label_span else "",
+            "spans": spans[1:],  # 先頭は著者
+        })
+    return out
 
 
-def fetch_search_items(genre, search_title):
-    """
-    検索結果を取得する。戻り値は (全アイテムのリスト, 許可カテゴリのset)。
-    カテゴリによる絞り込みは呼び出し側で行う（不一致時のデバッグ出力のため）。
-    """
-    base_url = GENRE_URLS.get(genre, GENRE_URLS["コミック"])
-    allowed_categories = ALLOWED_CATEGORIES.get(genre, ALLOWED_CATEGORIES["コミック"])
-    query = simplify_title_for_search(search_title)
-    url = base_url + requests.utils.quote(query)
+def fetch_search_items(genre, title, page=1):
+    """検索結果の本の一覧を返す。取得できなければ RequestException を送出する。"""
+    url = GENRE_URLS.get(genre, GENRE_URLS["コミック"]) + requests.utils.quote(simplify_title_for_search(title))
+    if page > 1:
+        url += f"&p={page}"
 
     last_error = None
     MIN_VALID_RESPONSE_LEN = 1000  # 正常な検索結果ページは通常数万文字ある
@@ -271,44 +270,10 @@ def fetch_search_items(genre, search_title):
             # 短めに切って早くリトライに回す。
             resp = requests.get(url, timeout=(10, 30), headers=HEADERS)
             resp.encoding = "utf-8"
-
-            # 極端に短い応答（数十文字程度）は、サーバー側の一時的な
-            # エラーページや不完全な応答である可能性が高いため、
-            # 接続エラーと同様にリトライ対象とする。
+            # 極端に短い応答はサーバー側の一時的なエラーとみなし、接続エラーと同じ扱いにする
             if len(resp.text) < MIN_VALID_RESPONSE_LEN:
-                print(
-                    f"⚠️ 応答が異常に短いため再試行します"
-                    f"（{attempt}/{MAX_RETRIES}回目, 文字数={len(resp.text)}, {url}）"
-                )
-                if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_BACKOFF_SEC * attempt)
-                    continue
-                else:
-                    print(f"❌ 最終試行でも応答が異常に短いままでした: {url}")
-                    return [], allowed_categories
-
-            items = extract_items(resp.text)
-
-            if not items:
-                # 0件だった場合、実際の <li class="item"> の生マークアップを
-                # そのまま出力する。これでname/sab等の内部構造がなぜ
-                # 抽出に失敗したか直接確認できる。
-                idx = resp.text.find('class="item"')
-                if idx != -1:
-                    start = max(0, idx - 20)
-                    raw_snippet = resp.text[start:start + 1200]
-                else:
-                    raw_snippet = "(class=\"item\" が見つかりませんでした)"
-                # 実際に BeautifulSoup が li.item として拾えている数を確認
-                soup_debug = BeautifulSoup(resp.text, "html.parser")
-                li_matched = len(soup_debug.select("li.item"))
-                print(
-                    f"    🩺 0件デバッグ [{url}] status={resp.status_code} len={len(resp.text)} "
-                    f"BeautifulSoupでのli.item一致数={li_matched}"
-                )
-                print(f"    🩺 生マークアップ抜粋: {raw_snippet}")
-
-            return items, allowed_categories
+                raise requests.exceptions.RequestException(f"応答が異常に短い（{len(resp.text)}文字）")
+            return parse_items(resp.text)
         except requests.exceptions.RequestException as e:
             last_error = e
             print(f"⚠️ 接続失敗（{attempt}/{MAX_RETRIES}回目, {url}）: {e}")
@@ -316,6 +281,185 @@ def fetch_search_items(genre, search_title):
                 time.sleep(RETRY_BACKOFF_SEC * attempt)
 
     raise last_error
+
+
+# ------------------------------------------------------------
+# 新刊の判定
+# ------------------------------------------------------------
+def base_label(label):
+    """レーベル名の末尾に巻数が付く表記（"ノヴァコミックス 4"）をそろえる。"""
+    return re.sub(r"\s*\d+$", "", label)
+
+
+def fmt_vol(v):
+    return str(int(v)) if v == int(v) else str(v)
+
+
+def candidates(items, title, genre, longer_titles):
+    """作品名で始まる対象分類の本に、目印・巻数・除外理由を付けて返す。"""
+    allowed = ALLOWED_CATEGORIES.get(genre, ALLOWED_CATEGORIES["コミック"])
+    for it in items:
+        if it["category"] not in allowed:
+            continue
+        rest = split_after_title(it["name"], title)
+        # 別の行の、より長い作品名に当たる本はその行のもの
+        if rest is None or any(split_after_title(it["name"], t) is not None for t in longer_titles):
+            continue
+        sig, value = signature_and_volume(rest)
+        excluded = "特装版・関連本" if NG_PATTERN.search(rest) else "外伝" if SPIN_PATTERN.search(rest) else None
+        # 作品名の直後が区切り（空白・記号）か。別作品（作品名＋ーズ 等）を1巻と誤認しないため
+        n = unicodedata.normalize("NFKC", it["name"])
+        at = n.rfind(rest) if rest else len(n)
+        boundary = rest == "" or not rest[0].isalnum() or (at > 0 and n[at - 1].isspace())
+        yield dict(it, sig=sig, value=value, excluded=excluded, rest=rest, boundary=boundary)
+
+
+def book_record(c):
+    """次回の基準としてシートに保存する本の情報。"""
+    return {"name": c["name"], "isbn": c["isbn"], "label": c["label"], "author": c["spans"][0] if c["spans"] else ""}
+
+
+def new_result(status):
+    return {"status": status, "new": [], "check": [], "save": None, "record": None, "date_change": None}
+
+
+def judge_unrecorded(found, today):
+    """B列が空の行（未発売の作品、または巻数をまだ記録していない作品）。"""
+    books = [c for c in found if not c["excluded"] and (c["value"] is not None or c["boundary"])]
+    if not books:
+        return new_result("未発売")
+    numbered = [c for c in books if c["value"] is not None]
+    if all(c["value"] <= 1 for c in numbered):  # 1巻（番号なしを含む）だけがある
+        pool, number = books, lambda c: 1.0
+    else:  # 既刊がある作品を登録した場合は、本編（一番多い目印）の最新巻を基準にする
+        main = max({c["sig"] for c in numbered}, key=lambda s: (sum(c["sig"] == s for c in numbered), s == ""))
+        pool, number = [c for c in numbered if c["sig"] == main], lambda c: c["value"]
+    if len({base_label(c["label"]) for c in pool}) > 1:  # 別の作品が混ざる可能性は人が確認する
+        result = new_result("要確認")
+        result["check"] = [f'{c["name"]}（{c["date"]}）レーベルが複数 {c["label"]}' for c in pool]
+        return result
+    pick = (min(pool, key=lambda c: c["date"]) if all(number(c) == 1 for c in pool)
+            else max(pool, key=number))
+    entry = dict(book_record(pick), vol=fmt_vol(number(pick)), date=pick["date"])
+    result = new_result("新刊あり")
+    result["save"] = book_record(pick)
+    if number(pick) == 1 or pick["date"] >= today:  # 過去の巻は記録するだけで通知しない
+        result["new"] = [entry]
+    else:
+        result.update(status="記録のみ", record=entry)
+    return result
+
+
+def judge(title, vol, cdate, genre, longer_titles, saved, today, fetch):
+    """
+    1行分の判定。vol/cdate はシートのB・C列、saved は前回保存した本（なければ None）、
+    fetch(page) は検索結果の本の一覧を返す関数。
+
+    本編の新刊の条件：作品名で始まる／レーベルが同じ／特装版・関連本・外伝でない／
+    巻数の直前の言葉（目印）が基準の本と同じ／基準の本より発売日が新しい。
+    """
+    items = fetch(1)
+    found = list(candidates(items, title, genre, longer_titles))
+    try:
+        current = float(vol)
+    except ValueError:
+        current = None
+
+    # 保存した本は、巻数がB列と一致するときだけ使う（手動でB列を直した場合は推測し直す）
+    saved_rest = split_after_title(saved["name"], title) if saved else None
+    if saved_rest is None or current is None or (signature_and_volume(saved_rest)[1] or 1.0) != current:
+        saved = None
+
+    def read_page2():
+        if len(items) >= 20:
+            found.extend(candidates(fetch(2), title, genre, longer_titles))
+
+    if not vol:
+        read_page2()
+        return judge_unrecorded(found, today)
+
+    def days_apart(c):
+        try:
+            return abs((datetime.strptime(c["date"], "%Y/%m/%d") - datetime.strptime(cdate, "%Y/%m/%d")).days)
+        except ValueError:
+            return 0
+
+    def find_anchor():
+        if saved:
+            for c in found:
+                if (saved["isbn"] and c["isbn"] == saved["isbn"]) or c["name"] == saved["name"]:
+                    return dict(c, from_site=True)
+            sig, value = signature_and_volume(saved_rest)  # 検索結果に無くても書名から基準を復元する
+            return {"name": saved["name"], "isbn": saved["isbn"], "date": cdate, "sig": sig, "value": value,
+                    "rest": saved_rest, "label": saved["label"], "spans": [saved["author"]], "from_site": False}
+        clean = [c for c in found if not c["excluded"] and c["sig"] is not None]
+        for cond in (
+            lambda c: c["date"] == cdate and c["value"] == current,
+            lambda c: c["date"] == cdate,
+            lambda c: c["value"] == current,
+        ):
+            hit = [c for c in clean if cond(c)]
+            if hit:
+                return min(hit, key=days_apart)
+        return None
+
+    anchor = find_anchor()
+    if not saved and (not anchor or anchor["date"] != cdate) and len(items) >= 20:
+        read_page2()
+        anchor = find_anchor()
+    if not anchor:
+        result = new_result("目印未特定")
+        result["check"] = ["検索結果が0件" if not items else "基準にできる本がない（作品名・巻数・発売日を確認）"]
+        return result
+
+    alt_sig = None
+    if anchor["sig"] is None:  # 番号のない1巻が基準の場合
+        alt_sig = re.sub(r"\s", "", anchor.get("rest", ""))
+        anchor = dict(anchor, sig="", value=1.0)
+
+    result = new_result("新刊なし")
+    base = cdate
+    if saved and anchor["from_site"] and anchor["date"] != cdate:  # 保存した本の発売日が動いた
+        base = anchor["date"]
+        result["date_change"] = (cdate, base)
+
+    author = anchor["spans"][0] if anchor["spans"] else ""
+    newer = sorted((c for c in found if base and c["date"] > base and c["isbn"] != anchor["isbn"]),
+                   key=lambda c: c["date"])
+    seen, high = set(), current
+    for c in newer:
+        if c["excluded"]:
+            continue
+        line = f'{c["name"]}（{c["date"]}）'
+        same_label = base_label(anchor["label"]) in map(base_label, [c["label"], *c["spans"]])
+        # レーベルが変わっても、同じ著者・同じ目印の次の巻なら続きとみなす
+        moved = (c["sig"] == anchor["sig"] and author in c["spans"] and c["value"] is not None
+                 and high is not None and high < c["value"] <= high + 1)
+        if not same_label and not moved:
+            continue
+        if c["value"] is None:
+            result["check"].append(f"{line}巻数なし")
+        elif c["sig"] not in (anchor["sig"], alt_sig):
+            result["check"].append(f"{line}本編の目印が違う")
+        elif current is not None and c["value"] <= current:
+            result["check"].append(f"{line}巻数が戻る")
+        elif high is not None and c["value"] > high + 5:
+            result["check"].append(f"{line}巻数が飛ぶ")
+        elif c["value"] not in seen:
+            seen.add(c["value"])
+            high = c["value"] if high is None else max(high, c["value"])
+            result["new"].append(dict(book_record(c), vol=fmt_vol(c["value"]), date=c["date"]))
+
+    if result["new"]:
+        result["status"] = "新刊あり"
+        top = max(result["new"], key=lambda n: float(n["vol"]))
+        result["save"] = {k: top[k] for k in ("name", "isbn", "label", "author")}
+    else:
+        if result["check"]:
+            result["status"] = "要確認"
+        if anchor["value"] == current:  # 巻数が一致する本だけを基準として保存する
+            result["save"] = book_record(anchor)
+    return result
 
 
 # ------------------------------------------------------------
@@ -328,7 +472,7 @@ def format_volume_label(volume):
     特殊なシリーズ表記）はそのままの文字列を使う。
     """
     s = str(volume).strip()
-    return f"第{s}巻" if s.isdigit() else s
+    return f"第{s}巻" if re.fullmatch(r"\d+(\.\d+)?", s) else s
 
 
 # Discord埋め込みの色（個別の新刊検知通知と、本日発売ダイジェストを
@@ -339,7 +483,7 @@ EMBED_COLOR_DAILY_DIGEST = 0x3498DB  # 青：本日発売ダイジェスト
 EMBED_COLOR_MANUAL_REVIEW_DIGEST = 0x9B59B6  # 紫：月次の手動確認まとめ
 
 
-def send_discord(title, volume, release_date_str, genre):
+def send_discord(title, volume, release_date_str, genre, headline="新刊の発売情報を見つけました！"):
     if not DISCORD_WEBHOOK_URL:
         return
 
@@ -351,7 +495,7 @@ def send_discord(title, volume, release_date_str, genre):
 
     volume_label = format_volume_label(volume)
     embed = {
-        "title": f"{emoji} 新刊の発売情報を見つけました！",
+        "title": f"{emoji} {headline}",
         "color": EMBED_COLOR_NEW_RELEASE,
         "fields": [
             {"name": "作品名", "value": title, "inline": False},
@@ -575,12 +719,10 @@ def send_monthly_manual_review_digest(rows):
     print(f"📬 月次の手動確認まとめを送信しました（{len(items)}件、{len(chunks)}メッセージ）。")
 
 
-def event_already_exists(calendar_service, summary, release_date):
+def find_event(calendar_service, summary, release_date):
     """
-    重複登録防止チェック。同じ日付に、同じsummary（タイトル+巻数表記）の
-    イベントが既に存在するか確認する。
-    テスト実行の繰り返しや、同じ行が複数回処理された場合などに
-    同一イベントが何件も追加されてしまうのを防ぐ。
+    指定日にある、同じsummary（タイトル+巻数表記）のイベントを返す（なければNone）。
+    重複登録の防止と、発売日が変わったときの予定の移動に使う。
     """
     day_start = datetime(release_date.year, release_date.month, release_date.day, tzinfo=JST)
     day_end = day_start + timedelta(days=1)
@@ -599,15 +741,33 @@ def event_already_exists(calendar_service, summary, release_date):
 
     for event in resp.get("items", []):
         if event.get("summary", "") == summary:
-            return True
-    return False
+            return event
+    return None
 
 
-def create_calendar_event(calendar_service, title, volume, release_date, genre=None):
+def event_dates(release_date):
+    return {
+        "start": {"date": release_date.strftime("%Y-%m-%d")},
+        "end": {"date": (release_date + timedelta(days=1)).strftime("%Y-%m-%d")},
+    }
+
+
+def move_calendar_event(calendar_service, title, volume, old_date, new_date, genre=None, isbn=""):
+    """発売日が変わった本の予定を新しい日付へ移す。元の予定がなければ新しく作る。"""
+    event = find_event(calendar_service, f"{title} {volume}", old_date)
+    if event is None:
+        create_calendar_event(calendar_service, title, volume, new_date, genre, isbn)
+        return
+    calendar_service.events().patch(
+        calendarId=CALENDAR_ID, eventId=event["id"], body=event_dates(new_date)
+    ).execute()
+
+
+def create_calendar_event(calendar_service, title, volume, release_date, genre=None, isbn=""):
     volume_label = format_volume_label(volume)
     summary = f"{title} {volume}"
 
-    if event_already_exists(calendar_service, summary, release_date):
+    if find_event(calendar_service, summary, release_date):
         print(f"⏭ カレンダーに同一イベントが既に存在するため登録をスキップ: {summary}")
         return False
 
@@ -617,17 +777,20 @@ def create_calendar_event(calendar_service, title, volume, release_date, genre=N
     event = {
         "summary": summary,
         "description": "\n".join(description_lines),
-        "start": {"date": release_date.strftime("%Y-%m-%d")},
-        "end": {"date": (release_date + timedelta(days=1)).strftime("%Y-%m-%d")},
+        **event_dates(release_date),
         # 本日発売ダイジェスト（send_daily_digest）がスプレッドシートのC列
         # （1タイトルにつき1つの日付しか持てない）ではなく、巻ごとに正しい
         # 日付を持つカレンダー側のイベントを直接読めるようにするための構造化データ。
         "extendedProperties": {
-            "private": {"title": title, "volume": str(volume), "genre": genre or ""}
+            "private": {"title": title, "volume": str(volume), "genre": genre or "", "isbn": isbn}
         },
     }
     calendar_service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
     return True
+
+
+def cell(row, index):
+    return str(row[index]).strip() if len(row) > index else ""
 
 
 def is_true(value):
@@ -702,7 +865,7 @@ def process_manual_rows(ws, calendar_service, rows):
             batch_update_row(
                 ws,
                 i,
-                {5: "完了", 6: force_text(now_jst().strftime("%Y/%m/%d")), 10: False},
+                {5: "完了", 6: force_text(now_jst().strftime("%Y/%m/%d")), 10: False, COL_NOTE: ""},
             )
 
             print(f"✅ 【手動登録成功】 Row {i}: {title}（{matched_volume}）を処理しました。")
@@ -769,6 +932,65 @@ def touch_manual_review_rows(ws, rows):
         batch_update_row(ws, i, {6: today_str})
 
 
+# シートの列番号（1始まり）
+COL_VOLUME, COL_DATE, COL_STATUS, COL_CHECKED = 2, 3, 5, 6
+SAVED_COLUMNS = {"name": 11, "isbn": 12, "label": 13, "author": 14}  # K〜N
+COL_NOTE = 15  # O
+
+
+def read_saved_book(row):
+    """前回保存した本（K〜N列）。K列が空ならNone。"""
+    book = {key: cell(row, col - 1) for key, col in SAVED_COLUMNS.items()}
+    return book if book["name"] else None
+
+
+def saved_cells(book):
+    return {col: force_text(book[key]) if book[key] else "" for key, col in SAVED_COLUMNS.items()}
+
+
+def to_cell_volume(volume):
+    value = float(volume)
+    return int(value) if value.is_integer() else value
+
+
+def apply_result(ws, calendar_service, row_index, row, result):
+    """判定結果を、カレンダー・Discord・シートに反映する。"""
+    title, genre = cell(row, 0), cell(row, 3)
+    notify = is_true(cell(row, 6))
+    updates = {COL_STATUS: "完了", COL_CHECKED: force_text(now_jst().strftime("%Y/%m/%d"))}
+
+    if result["date_change"]:
+        old, new = result["date_change"]
+        isbn = (read_saved_book(row) or {}).get("isbn", "")  # 日付が動いた本は、保存していた基準の本
+        move_calendar_event(calendar_service, title, cell(row, 1),
+                            parse_date_flexible(old), parse_date_flexible(new), genre, isbn)
+        updates[COL_DATE] = force_text(new)
+        if notify:
+            send_discord(title, cell(row, 1), f"{old} → {new}", genre, headline="発売日が変わりました！")
+        print(f"🗓 発売日変更: {title} {old} → {new}")
+
+    for entry in result["new"]:
+        release_date = parse_date_flexible(entry["date"])
+        create_calendar_event(calendar_service, title, entry["vol"], release_date, genre, entry["isbn"])
+        if notify:
+            send_discord(title, entry["vol"], entry["date"], genre)
+            print(f"🔔 登録＆Discord通知送信: {title} {entry['vol']}巻")
+        else:
+            print(f"📅 カレンダー登録のみ（通知OFF）: {title} {entry['vol']}巻")
+
+    latest = max(result["new"], key=lambda n: float(n["vol"])) if result["new"] else result["record"]
+    if latest:
+        updates[COL_VOLUME] = to_cell_volume(latest["vol"])
+        updates[COL_DATE] = force_text(latest["date"])
+    if result["save"]:
+        updates.update(saved_cells(result["save"]))
+    updates[COL_NOTE] = " / ".join(result["check"][:3]) or ("未発売" if result["status"] == "未発売" else "")
+    batch_update_row(ws, row_index, updates)
+
+    if not result["new"] and not result["date_change"]:
+        print(f"⏭ {result['status']}: {title}" + (f"（{updates[COL_NOTE]}）" if updates[COL_NOTE] else ""))
+
+
 def process_auto_rows(ws, calendar_service, rows, daily_limit):
     touch_manual_review_rows(ws, rows)
     targets = select_rows_to_check(rows, daily_limit)
@@ -783,87 +1005,20 @@ def process_auto_rows(ws, calendar_service, rows, daily_limit):
 
     consecutive_network_failures = 0
 
+    all_titles = {(cell(r, 3), cell(r, 0)) for r in rows[1:] if cell(r, 0)}
+
     for i, row, _ in targets:
-        title = row[0].strip() if len(row) > 0 else ""
-        current_latest_volume = row[1].strip() if len(row) > 1 else ""
-        genre = row[3].strip() if len(row) > 3 else ""
-        is_notify_target = row[6].strip() if len(row) > 6 else ""
+        title, genre = cell(row, 0), cell(row, 3)
+        # 同じジャンルで、この作品名より長い作品名の行がある場合、その本はそちらの行のもの
+        longer_titles = [t for g, t in all_titles if g == genre and t != title
+                         and normalize_title(t).startswith(normalize_title(title))]
 
         try:
-            m = re.match(r"(.+?)([0-9]+)$", title)
-            search_title = m.group(1).strip() if m else title
-
-            all_items, allowed_categories = fetch_search_items(genre, search_title)
+            result = judge(title, cell(row, 1), cell(row, 2), genre, longer_titles, read_saved_book(row),
+                           now_jst().strftime("%Y/%m/%d"),
+                           lambda page: fetch_search_items(genre, title, page))
             consecutive_network_failures = 0  # 成功したのでリセット
-            normalized_search = normalize_title(search_title)
-
-            # まずカテゴリを絞らずタイトル一致だけで候補を探し、
-            # その中でカテゴリが許可リストに入っているものだけを採用する。
-            # こうすることで「タイトルは一致するがカテゴリで弾かれた」ケースを
-            # デバッグ出力で判別できるようにする。
-            title_matches = [it for it in all_items if normalize_title(it["title"]) == normalized_search]
-            exact_matches = [it for it in title_matches if it["category"] in allowed_categories]
-
-            if exact_matches:
-                current_vol_num = int(current_latest_volume) if current_latest_volume.isdigit() else 0
-                # 2カ月連続発売のように複数巻が同時に検索結果へ出ることがあるため、
-                # 最大巻数だけでなく現在巻数より新しい巻を「全て」登録・通知する
-                # （最大巻数だけ採用すると、間の巻の通知が飛ばないバグになる）。
-                new_volumes = sorted(
-                    (it for it in exact_matches if it["volume"] > current_vol_num),
-                    key=lambda it: it["volume"],
-                )
-
-                if new_volumes:
-                    for it in new_volumes:
-                        volume = it["volume"]
-                        release_date = datetime(it["year"], it["month"], it["day"])
-                        create_calendar_event(calendar_service, title, volume, release_date, genre)
-                        if is_true(is_notify_target):
-                            send_discord(title, volume, release_date.strftime("%Y/%m/%d"), genre)
-                            print(f"🔔 登録＆Discord通知送信: {title} 第{volume}巻")
-                        else:
-                            print(f"📅 カレンダー登録のみ（通知OFF）: {title} 第{volume}巻")
-
-                    latest = new_volumes[-1]
-                    latest_release_date = datetime(latest["year"], latest["month"], latest["day"])
-                    batch_update_row(
-                        ws,
-                        i,
-                        {
-                            2: latest["volume"],
-                            3: force_text(latest_release_date.strftime("%Y/%m/%d")),
-                            5: "完了",
-                            6: force_text(now_jst().strftime("%Y/%m/%d")),
-                        },
-                    )
-                else:
-                    print(f"⏭ 最新巻数の更新なし: {title}")
-                    batch_update_row(
-                        ws, i, {5: "完了", 6: force_text(now_jst().strftime("%Y/%m/%d"))}
-                    )
-            elif title_matches:
-                # タイトルは一致したがカテゴリで除外された → ホワイトリストの不足
-                found_categories = sorted({it["category"] for it in title_matches})
-                print(
-                    f"🚫 タイトルは一致するがカテゴリ不一致: {title} "
-                    f"（見つかったカテゴリ: {found_categories} / 許可: {sorted(allowed_categories)}）"
-                )
-                batch_update_row(
-                    ws, i, {5: "完了", 6: force_text(now_jst().strftime("%Y/%m/%d"))}
-                )
-            else:
-                # タイトル自体が1件も一致しなかった → 検索結果に候補があれば
-                # 近そうなタイトルを数件出して、表記ゆれの手がかりにする
-                sample_titles = [it["title"] for it in all_items[:5]]
-                print(
-                    f"🔍 完全一致する作品が見つかりませんでした: {title}（検索クエリ: {search_title}）"
-                    f" / 検索結果件数: {len(all_items)}"
-                    f"{' / 候補例: ' + str(sample_titles) if sample_titles else ''}"
-                )
-                batch_update_row(
-                    ws, i, {5: "完了", 6: force_text(now_jst().strftime("%Y/%m/%d"))}
-                )
+            apply_result(ws, calendar_service, i, row, result)
 
         except requests.exceptions.RequestException as e:
             consecutive_network_failures += 1
