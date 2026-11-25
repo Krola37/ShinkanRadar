@@ -20,7 +20,7 @@ jobs:
             "https://comic.sumikko.info/search/?k=%E3%82%AD%E3%83%B3%E3%82%B0%E3%83%80%E3%83%A0" || echo "❌ curl失敗"
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
