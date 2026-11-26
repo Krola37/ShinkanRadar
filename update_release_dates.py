@@ -387,7 +387,9 @@ def judge(title, vol, cdate, genre, longer_titles, saved, today, fetch):
     def find_anchor():
         if saved:
             for c in found:
-                if (saved["isbn"] and c["isbn"] == saved["isbn"]) or c["name"] == saved["name"]:
+                # ISBNは手動修正で古いまま残ることがあるので、巻数がB列と違う本には使わない
+                same_isbn = saved["isbn"] and c["isbn"] == saved["isbn"] and (c["value"] or 1.0) == current
+                if same_isbn or c["name"] == saved["name"]:
                     return dict(c, from_site=True)
             sig, value = signature_and_volume(saved_rest)  # 検索結果に無くても書名から基準を復元する
             return {"name": saved["name"], "isbn": saved["isbn"], "date": cdate, "sig": sig, "value": value,
@@ -481,6 +483,7 @@ def format_volume_label(volume):
 EMBED_COLOR_NEW_RELEASE = 0xE67E22  # オレンジ：新刊を検知した個別通知
 EMBED_COLOR_DAILY_DIGEST = 0x3498DB  # 青：本日発売ダイジェスト
 EMBED_COLOR_MANUAL_REVIEW_DIGEST = 0x9B59B6  # 紫：月次の手動確認まとめ
+EMBED_COLOR_CHECK = 0xF1C40F  # 黄：要確認
 
 
 def send_discord(title, volume, release_date_str, genre, headline="新刊の発売情報を見つけました！"):
@@ -953,8 +956,51 @@ def to_cell_volume(volume):
     return int(value) if value.is_integer() else value
 
 
+def send_check_notice(entries):
+    """
+    今回の実行で新しく現れた「要確認」を、まとめてDiscordに送る。
+    entries は (作品名, ジャンル, 新しい内容のリスト) のリスト。
+    要確認は人の対応を求める通知なので、G列（新刊の通知フラグ）に関係なく送る。
+    """
+    if not DISCORD_WEBHOOK_URL or not entries:
+        return
+
+    blocks = []
+    for title, genre, lines in entries:
+        url = build_manual_search_url(title, genre)
+        head = f"**[{title}]({url})**" if url else f"**{title}**"
+        blocks.append("\n".join([head] + [f"・{line}" for line in lines])[:1000])
+
+    # Discordの埋め込みdescription上限（4096文字）を超えないように分割する
+    chunks = [[]]
+    for block in blocks:
+        if chunks[-1] and sum(len(b) + 2 for b in chunks[-1]) + len(block) > 3800:
+            chunks.append([])
+        chunks[-1].append(block)
+
+    for idx, chunk in enumerate(chunks, start=1):
+        title_label = f"⚠️ 要確認（{now_jst().strftime('%Y/%m/%d')}）"
+        if len(chunks) > 1:
+            title_label += f"（{idx}/{len(chunks)}）"
+        embed = {
+            "title": title_label,
+            "description": "\n\n".join(chunk),
+            "color": EMBED_COLOR_CHECK,
+            "footer": {"text": f"要確認：{len(entries)}作品（本編ならB・C列を直し、K列を空にしてJ列をTRUE）"},
+        }
+        try:
+            requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
+        except Exception as e:
+            print(f"❌ 要確認の通知エラー: {e}")
+
+    print(f"📣 要確認を通知しました（{len(entries)}作品）。")
+
+
 def apply_result(ws, calendar_service, row_index, row, result):
-    """判定結果を、カレンダー・Discord・シートに反映する。"""
+    """
+    判定結果を、カレンダー・Discord・シートに反映する。
+    戻り値は、O列にまだ書かれていなかった「要確認」の内容（通知対象）。
+    """
     title, genre = cell(row, 0), cell(row, 3)
     notify = is_true(cell(row, 6))
     updates = {COL_STATUS: "完了", COL_CHECKED: force_text(now_jst().strftime("%Y/%m/%d"))}
@@ -984,11 +1030,15 @@ def apply_result(ws, calendar_service, row_index, row, result):
         updates[COL_DATE] = force_text(latest["date"])
     if result["save"]:
         updates.update(saved_cells(result["save"]))
-    updates[COL_NOTE] = " / ".join(result["check"][:3]) or ("未発売" if result["status"] == "未発売" else "")
+    # O列に前回の内容が残っているので、そこに無いものだけを新しい要確認とする
+    previous_note = cell(row, COL_NOTE - 1)
+    new_checks = [line for line in result["check"] if line not in previous_note]
+    updates[COL_NOTE] = " / ".join(result["check"]) or ("未発売" if result["status"] == "未発売" else "")
     batch_update_row(ws, row_index, updates)
 
     if not result["new"] and not result["date_change"]:
         print(f"⏭ {result['status']}: {title}" + (f"（{updates[COL_NOTE]}）" if updates[COL_NOTE] else ""))
+    return new_checks
 
 
 def process_auto_rows(ws, calendar_service, rows, daily_limit):
@@ -1003,9 +1053,18 @@ def process_auto_rows(ws, calendar_service, rows, daily_limit):
         last_update_display = "未チェック" if last_update == datetime.min else last_update.strftime("%Y/%m/%d")
         print(f"    ・{title}（前回チェック: {last_update_display}）")
 
-    consecutive_network_failures = 0
-
     all_titles = {(cell(r, 3), cell(r, 0)) for r in rows[1:] if cell(r, 0)}
+
+    check_entries = []
+    try:
+        check_rows(ws, calendar_service, targets, all_titles, check_entries)
+    finally:
+        # 途中で中断しても、O列に書いた要確認は通知する（次回は「既知」になり送られないため）
+        send_check_notice(check_entries)
+
+
+def check_rows(ws, calendar_service, targets, all_titles, check_entries):
+    consecutive_network_failures = 0
 
     for i, row, _ in targets:
         title, genre = cell(row, 0), cell(row, 3)
@@ -1018,7 +1077,9 @@ def process_auto_rows(ws, calendar_service, rows, daily_limit):
                            now_jst().strftime("%Y/%m/%d"),
                            lambda page: fetch_search_items(genre, title, page))
             consecutive_network_failures = 0  # 成功したのでリセット
-            apply_result(ws, calendar_service, i, row, result)
+            new_checks = apply_result(ws, calendar_service, i, row, result)
+            if new_checks:
+                check_entries.append((title, genre, new_checks))
 
         except requests.exceptions.RequestException as e:
             consecutive_network_failures += 1
