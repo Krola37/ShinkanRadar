@@ -387,7 +387,9 @@ def judge(title, vol, cdate, genre, longer_titles, saved, today, fetch):
     def find_anchor():
         if saved:
             for c in found:
-                if (saved["isbn"] and c["isbn"] == saved["isbn"]) or c["name"] == saved["name"]:
+                # ISBNは手動修正で古いまま残ることがあるので、巻数がB列と違う本には使わない
+                same_isbn = saved["isbn"] and c["isbn"] == saved["isbn"] and (c["value"] or 1.0) == current
+                if same_isbn or c["name"] == saved["name"]:
                     return dict(c, from_site=True)
             sig, value = signature_and_volume(saved_rest)  # 検索結果に無くても書名から基準を復元する
             return {"name": saved["name"], "isbn": saved["isbn"], "date": cdate, "sig": sig, "value": value,
@@ -984,7 +986,7 @@ def send_check_notice(entries):
             "title": title_label,
             "description": "\n\n".join(chunk),
             "color": EMBED_COLOR_CHECK,
-            "footer": {"text": f"要確認：{len(entries)}作品（本編ならB・C・K列を直してJ列をTRUE）"},
+            "footer": {"text": f"要確認：{len(entries)}作品（本編ならB・C列を直し、K列を空にしてJ列をTRUE）"},
         }
         try:
             requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
